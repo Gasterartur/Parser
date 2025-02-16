@@ -1,109 +1,105 @@
 require("dotenv").config();
 const TelegramBot = require("node-telegram-bot-api");
 const puppeteer = require("puppeteer");
-const express = require("express");
-const http = require("http");
-const socketIo = require("socket.io");
 const sqlite3 = require("sqlite3").verbose();
-const axios = require("axios");
+const fs = require("fs");
 
-const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
+// 🔹 Настройки
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID; // ID админа для уведомлений
 
-// 🔹 Создаем Express-сервер и WebSocket
-const app = express();
-const server = http.createServer(app);
-const io = socketIo(server);
-app.use(express.static("public"));
+// 🔹 Подключаем бота
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 
-// 🔹 Инициализация SQLite
-const db = new sqlite3.Database("prices.db", (err) => {
-    if (err) return console.error("Ошибка SQLite:", err.message);
-    console.log("✅ Подключено к базе данных SQLite");
-});
+// 🔹 Подключаем SQLite
+const dbFile = "./prices.db";
+const dbExists = fs.existsSync(dbFile);
+const db = new sqlite3.Database(dbFile);
 
-// 🔹 Создаем таблицу, если ее нет
-db.run(`CREATE TABLE IF NOT EXISTS subscriptions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id INTEGER,
-    url TEXT,
-    last_price TEXT
-)`);
+// 🔹 Если базы нет — создаём таблицу
+if (!dbExists) {
+    db.serialize(() => {
+        db.run(`CREATE TABLE prices (
+            url TEXT PRIMARY KEY,
+            price TEXT,
+            last_update DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`);
+    });
+}
 
-// 📌 Функция парсинга цены
+// 📌 Читаем ссылки из базы данных
+async function loadUrlsFromDB() {
+    return new Promise((resolve, reject) => {
+        db.all("SELECT url, price FROM prices", [], (err, rows) => {
+            if (err) {
+                reject(err);
+            } else {
+                resolve(rows);
+            }
+        });
+    });
+}
+
+// 📌 Проверяем цену на сайте
 async function checkPrice(url) {
     const browser = await puppeteer.launch({ headless: "new" });
     const page = await browser.newPage();
     await page.goto(url, { waitUntil: "domcontentloaded" });
 
-    // ❗ Настроить селекторы для разных сайтов
-    let price;
-    if (url.includes("wildberries.ru")) {
-        price = await page.$eval(".price-block__final-price", el => el.textContent.trim());
-    } else if (url.includes("ozon.ru")) {
-        price = await page.$eval(".e1j9birj0", el => el.textContent.trim());
-    } else {
-        price = await page.$eval(".price", el => el.textContent.trim());
+    try {
+        const price = await page.$eval(".price_value", el => el.textContent.trim()); 
+        await browser.close();
+        return price;
+    } catch (error) {
+        await browser.close();
+        throw new Error("Не удалось получить цену");
     }
-
-    await browser.close();
-    return price;
 }
 
-// 📌 Подписка на товар
-bot.onText(/\/subscribe (.+)/, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const url = match[1];
+// 📌 Проверяем все цены и обновляем базу
+async function checkAllPrices() {
+    const products = await loadUrlsFromDB();
 
-    db.run("INSERT INTO subscriptions (chat_id, url, last_price) VALUES (?, ?, ?)", [chatId, url, "0"], (err) => {
-        if (err) return bot.sendMessage(chatId, "Ошибка при подписке!");
-        bot.sendMessage(chatId, `✅ Ты подписался на ${url}`);
-        io.emit("new-subscription", { chatId, url });
-    });
+    for (const product of products) {
+        try {
+            const newPrice = await checkPrice(product.url);
+            console.log(`🔍 Проверка: ${product.url} → ${newPrice}`);
+
+            // Сравнение с локальной базой
+            db.get("SELECT price FROM prices WHERE url = ?", [product.url], async (err, row) => {
+                if (err) {
+                    console.error("Ошибка базы данных:", err);
+                    return;
+                }
+
+                const lastPrice = row ? row.price : null;
+
+                if (newPrice !== lastPrice) {
+                    console.log(`💰 Цена изменилась! ${product.url}: ${lastPrice} → ${newPrice}`);
+                    bot.sendMessage(ADMIN_CHAT_ID, `🔥 Цена обновлена! ${product.url} - ${newPrice}`);
+
+                    // Обновляем локальную базу SQLite
+                    db.run("INSERT INTO prices (url, price, last_update) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(url) DO UPDATE SET price = ?, last_update = CURRENT_TIMESTAMP", 
+                           [product.url, newPrice, newPrice]);
+                }
+            });
+
+        } catch (error) {
+            console.error("Ошибка парсинга:", error);
+        }
+    }
+}
+
+// 📌 Команда для проверки цен вручную
+bot.onText(/\/check/, async msg => {
+    const chatId = msg.chat.id;
+    bot.sendMessage(chatId, "⏳ Проверяю цены...");
+    await checkAllPrices();
+    bot.sendMessage(chatId, "✅ Проверка завершена!");
 });
 
-// 📌 Проверка цен каждые 5 минут
-async function checkAllPrices() {
-    db.all("SELECT * FROM subscriptions", async (err, rows) => {
-        if (err) return console.error("Ошибка SQLite:", err);
+// 📌 Автоматическая проверка каждые 5 минут
+setInterval(checkAllPrices, 300000);
 
-        for (const row of rows) {
-            try {
-                const newPrice = await checkPrice(row.url);
-
-                if (newPrice !== row.last_price) {
-                    bot.sendMessage(row.chat_id, `🔥 Цена обновлена! ${row.url} - ${newPrice}`);
-
-                    db.run("UPDATE subscriptions SET last_price = ? WHERE id = ?", [newPrice, row.id]);
-                    io.emit("price-update", { url: row.url, price: newPrice });
-                }
-            } catch (error) {
-                console.error("Ошибка парсинга:", error);
-            }
-        }
-    });
-}
-setInterval(checkAllPrices, 300000); // 5 минут
-
-// 📌 Загрузка списка товаров из удаленной базы (пример)
-async function fetchRemoteProducts() {
-    try {
-        const response = await axios.get("https://your-api.com/products");
-        const products = response.data; // Должно быть [{ url: "...", price: "..." }, {...}]
-        
-        for (const product of products) {
-            const newPrice = await checkPrice(product.url);
-
-            if (newPrice !== product.price) {
-                console.log(`💰 Цена изменилась: ${product.url} - ${newPrice}`);
-                io.emit("price-update", { url: product.url, price: newPrice });
-            }
-        }
-    } catch (error) {
-        console.error("Ошибка загрузки удаленных товаров:", error);
-    }
-}
-setInterval(fetchRemoteProducts, 600000); // 10 минут
-
-// 📌 Запуск сервера
-const PORT = 3000;
-server.listen(PORT, () => console.log(`🚀 Сервер работает на http://localhost:${PORT}`));
+// 📌 Запуск
+console.log("🚀 Бот запущен!");
